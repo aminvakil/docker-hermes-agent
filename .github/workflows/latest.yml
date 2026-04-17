@@ -1,0 +1,172 @@
+---
+name: Build Hermes Agent
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hermes-agent-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPO: NousResearch/hermes-agent
+  UPSTREAM_GIT_URL: https://github.com/NousResearch/hermes-agent.git
+
+jobs:
+  resolve:
+    name: Resolve upstream refs
+    runs-on: ubuntu-latest
+    outputs:
+      image_name: ${{ steps.image.outputs.name }}
+      release_tag: ${{ steps.release.outputs.tag }}
+      main_sha: ${{ steps.main.outputs.sha }}
+    steps:
+      - name: Determine Quay image name
+        id: image
+        shell: bash
+        run: |
+          repo_name="${GITHUB_REPOSITORY#*/}"
+          repo_name="${repo_name#docker-}"
+          echo "name=quay.io/${GITHUB_REPOSITORY_OWNER}/${repo_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Get latest upstream release tag
+        id: release
+        shell: bash
+        run: |
+          tag=$(curl -fsSL "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Get latest upstream main commit
+        id: main
+        shell: bash
+        run: |
+          sha=$(git ls-remote "${UPSTREAM_GIT_URL}" refs/heads/main | cut -f1)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  build-release:
+    name: Build latest release
+    needs: resolve
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_NAME: ${{ needs.resolve.outputs.image_name }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+    steps:
+      - name: Check out upstream release
+        uses: actions/checkout@main
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.RELEASE_TAG }}
+          path: hermes-agent
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@master
+
+      - name: Check whether release image already exists
+        id: exists
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          if docker manifest inspect "${IMAGE_NAME}:${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Login to Quay
+        if: github.event_name != 'pull_request' && steps.exists.outputs.skip != 'true'
+        uses: docker/login-action@master
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - name: Build and optionally push release image
+        if: github.event_name == 'pull_request' || steps.exists.outputs.skip != 'true'
+        uses: docker/build-push-action@master
+        with:
+          context: ./hermes-agent
+          file: ./hermes-agent/Dockerfile
+          pull: true
+          push: ${{ github.event_name != 'pull_request' }}
+          load: ${{ github.event_name == 'pull_request' }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ env.RELEASE_TAG }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPO }}
+            org.opencontainers.image.revision=${{ env.RELEASE_TAG }}
+            org.opencontainers.image.version=${{ env.RELEASE_TAG }}
+
+      - name: Smoke test release image
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          docker run --rm "${IMAGE_NAME}:${RELEASE_TAG}" --help >/dev/null
+
+  build-main:
+    name: Build latest commit
+    needs: resolve
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_NAME: ${{ needs.resolve.outputs.image_name }}
+      MAIN_SHA: ${{ needs.resolve.outputs.main_sha }}
+    steps:
+      - name: Check out upstream main
+        uses: actions/checkout@main
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.MAIN_SHA }}
+          path: hermes-agent
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@master
+
+      - name: Check whether main image already exists
+        id: exists
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          if docker manifest inspect "${IMAGE_NAME}:${MAIN_SHA}" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Login to Quay
+        if: github.event_name != 'pull_request' && steps.exists.outputs.skip != 'true'
+        uses: docker/login-action@master
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - name: Build and optionally push main image
+        if: github.event_name == 'pull_request' || steps.exists.outputs.skip != 'true'
+        uses: docker/build-push-action@master
+        with:
+          context: ./hermes-agent
+          file: ./hermes-agent/Dockerfile
+          pull: true
+          push: ${{ github.event_name != 'pull_request' }}
+          load: ${{ github.event_name == 'pull_request' }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ env.MAIN_SHA }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPO }}
+            org.opencontainers.image.revision=${{ env.MAIN_SHA }}
+            org.opencontainers.image.version=${{ env.MAIN_SHA }}
+
+      - name: Smoke test main image
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          docker run --rm "${IMAGE_NAME}:${MAIN_SHA}" --help >/dev/null
